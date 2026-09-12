@@ -120,6 +120,25 @@ config CPU_FREQ_DEFAULT_GOV_SCHEDUTIL
 	  have a look at the help section of that governor. The fallback
 	  governor will be 'performance'.
 
+config CPU_FREQ_DEFAULT_GOV_WALT
+	bool "walt"
+	depends on SMP
+	depends on SCHED_WALT
+	# Selected, not depended on: a choice entry must not depend on a symbol
+	# that a sibling entry selects, or kconfig reports a recursive dependency
+	# (the schedutil entry selects CPU_FREQ_GOV_SCHEDUTIL as well).
+	select CPU_FREQ_GOV_SCHEDUTIL
+	select CPU_FREQ_GOV_WALT
+	select CPU_FREQ_GOV_PERFORMANCE
+	help
+	  Use the 'walt' CPUFreq governor by default. This is the port of
+	  Qualcomm's WALT governor: the frequency decision comes from WALT's
+	  window assisted load tracking (hispeed, related-thread-group and
+	  predictive-load boosts) instead of pure per-CPU utilization. It is
+	  built on the schedutil framework, whose governor is therefore
+	  selected automatically. If unsure, have a look at the help section of
+	  that governor. The fallback governor will be 'performance'.
+
 endchoice
 
 config CPU_FREQ_GOV_PERFORMANCE
@@ -229,6 +248,21 @@ config CPU_FREQ_GOV_SCHEDUTIL
 	  case, it is proportional to the current frequency of the CPU.  The
 	  frequency tipping point is at utilization/capacity equal to 80% in
 	  both cases.
+
+	  If in doubt, say N.
+
+config CPU_FREQ_GOV_WALT
+	bool "'walt' cpufreq policy governor (Qualcomm WALT port)"
+	depends on CPU_FREQ && SMP && SCHED_WALT && CPU_FREQ_GOV_SCHEDUTIL
+	select CPU_FREQ_GOV_ATTR_SET
+	select IRQ_WORK
+	help
+	  Port of Qualcomm's WALT cpufreq governor (cpufreq_walt.c) on top of
+	  this kernel's schedutil framework. It drives the CPU frequency from
+	  the WALT (window assisted load tracking) signals and exposes the
+	  waltgov tunables (hispeed_load, hispeed_freq, adaptive_low_freq,
+	  adaptive_high_freq, target_load_thresh, target_load_shift, pl and
+	  boost) via sysfs, like the original governor does.
 
 	  If in doubt, say N.
 
