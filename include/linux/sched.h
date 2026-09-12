@@ -554,6 +554,9 @@ struct sched_entity {
 
 #ifdef CONFIG_SCHED_WALT
 #define RAVG_HIST_SIZE_MAX  5
+#define NUM_BUSY_BUCKETS    10
+
+struct walt_related_thread_group;
 
 /* ravg represents frequency scaled cpu-demand of tasks */
 struct ravg {
@@ -582,8 +585,18 @@ struct ravg {
 	u64 mark_start;
 	u32 sum, demand;
 	u32 sum_history[RAVG_HIST_SIZE_MAX];
+	u32 pred_demand;
+	u8 busy_buckets[NUM_BUSY_BUCKETS];
+	u32 grp_id;
 	u32 curr_window, prev_window;
 	u16 active_windows;
+
+	/*
+	 * Wallclock of the last wakeup (0 = never woken since boot). Used by
+	 * WALT's early detection: how long a task has been awake tells a
+	 * sustained load from a task that is about to finish.
+	 */
+	u64 last_wake_ts;
 };
 #endif
 
