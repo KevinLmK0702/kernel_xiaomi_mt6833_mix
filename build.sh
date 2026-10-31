@@ -84,6 +84,10 @@ if [ -f "out/arch/arm64/boot/Image.gz" ]; then
 
     sed -i "s/kernel\.string=.*/kernel.string=$KER_STR/" anykernel.sh
 
+    # Remove the tuna example patches from AnyKernel3 (otherwise they will write useless files to the ramdisk)
+    sed -i '/^backup_file init\.rc;/,/^append_file fstab\.tuna/d' anykernel.sh
+
+    rm -f "../Mix-Kernel-Vanilla-$DATE_STR.zip"
     zip -r "../Mix-Kernel-Vanilla-$DATE_STR.zip" *
 
     cd ..  
