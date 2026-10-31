@@ -76,6 +76,11 @@ ccflags-y += \
     -I$(srctree)/drivers/misc/mediatek/video/mt6833/videox \
     -I$(srctree)/drivers/misc/mediatek/video/mt6833/dispsys \
     -I$(srctree)/drivers/misc/mediatek/sspm/mt6833
+# MTK_GED_KPI was missing for this platform (every other SoC branch sets it),
+# which compiles the KPI data path out of ged_kpi.c entirely. That is why the
+# composer reported frame data never reaches GED and its DVFS governor never
+# gets a decision input.
+ccflags-y += -DMTK_GED_KPI
 endif
 
 ifeq ($(CONFIG_MACH_MT6877),y)

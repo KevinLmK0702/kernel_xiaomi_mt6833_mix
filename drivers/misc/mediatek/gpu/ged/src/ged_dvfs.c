@@ -1020,13 +1020,21 @@ static int ged_dvfs_fb_gpu_dvfs(int t_gpu, int t_gpu_target,
 			int i32NewFreqID =
 			(int) mt_gpufreq_get_cur_freq_index();
 
-			if (dvfs_step_mode == 0)
-				i32NewFreqID = 0;
-			else
+			/*
+			 * Hold the OPP that is already programmed.
+			 *
+			 * This used to force index 0, the fastest OPP, assuming the
+			 * fallback was a short lived state. It is not: the old fallback
+			 * condition was true on every frame, so that one-off commit
+			 * pinned the GPU at the maximum frequency for the whole
+			 * uptime. Holding is neutral, and the loading based backup
+			 * path still scales normally.
+			 */
+			if (dvfs_step_mode != 0) {
 				i32NewFreqID -= (dvfs_step_mode&0xff);
-
-			if (i32NewFreqID < 0)
-				i32NewFreqID = 0;
+				if (i32NewFreqID < 0)
+					i32NewFreqID = 0;
+			}
 
 			ged_dvfs_gpu_freq_commit((unsigned long)i32NewFreqID
 			, mt_gpufreq_get_freq_by_idx((unsigned long)

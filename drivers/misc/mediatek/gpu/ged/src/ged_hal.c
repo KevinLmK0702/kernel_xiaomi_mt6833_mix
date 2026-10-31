@@ -392,9 +392,28 @@ static ssize_t gpu_utilization_show(struct kobject *kobj,
 	unsigned int block = 0;
 	unsigned int idle = 0;
 
-	mtk_get_gpu_loading(&loading);
-	mtk_get_gpu_block(&block);
-	mtk_get_gpu_idle(&idle);
+	/*
+	 * Ask the GPU driver for a fresh sample first.
+	 *
+	 * gpu_av_loading is only refreshed inside
+	 * ged_dvfs_cal_gpu_utilization_ex(), which runs from the DVFS loop
+	 * (timer backup / vsync). If that loop is not running, or
+	 * gpu_dvfs_enable is 0, the cached value stays 0 forever. Fall back
+	 * to the cached value when no callback is registered (GPU driver not
+	 * probed yet).
+	 */
+	if (ged_dvfs_cal_gpu_utilization_ex_fp != NULL) {
+		struct GpuUtilization_Ex util_ex;
+
+		ged_dvfs_cal_gpu_utilization_ex_fp(&loading, &block, &idle,
+						   &util_ex);
+		/* block is tracked by GED itself, restore the cached value */
+		mtk_get_gpu_block(&block);
+	} else {
+		mtk_get_gpu_loading(&loading);
+		mtk_get_gpu_block(&block);
+		mtk_get_gpu_idle(&idle);
+	}
 
 	return scnprintf(buf, PAGE_SIZE, "%u %u %u\n", loading, block, idle);
 }

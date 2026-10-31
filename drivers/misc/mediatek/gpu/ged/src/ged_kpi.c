@@ -275,8 +275,6 @@ static unsigned int is_GED_KPI_enabled = 1;
 static unsigned int ap_self_frc_detection_rate = 20;
 #ifdef GED_ENABLE_FB_DVFS
 static unsigned int g_force_gpu_dvfs_fallback;
-static int g_fb_dvfs_threshold = 80;
-module_param(g_fb_dvfs_threshold, int, 0644);
 #endif /* GED_ENABLE_FB_DVFS */
 module_param(gx_dfps, uint, 0644);
 module_param(gx_frc_mode, uint, 0644);
@@ -711,6 +709,33 @@ static inline void ged_kpi_calc_kpi_info(u64 ulID, struct GED_KPI *psKPI
 			psKPI->ullTimeStampS - g_pre_TimeStampS;
 		g_gpu_time_accum += psKPI->t_gpu;
 		g_CRemTimeAccu += psKPI->ullTimeStampS - psKPI->ullTimeStamp1;
+
+		/* Dequeue -> queue is how long the client spent producing
+		 * the frame on the CPU. g_ResponseTimeAccu had no
+		 * accumulation site at all in this drop, so the node always
+		 * reported zero.
+		 *
+		 * It must not use ullTimeStamp2: gpu_time above is already
+		 * ullTimeStamp2 - ullTimeStamp1, so that would just duplicate
+		 * gpu_time. ullTimeStampD is the dequeue event.
+		 */
+		if (psKPI->ullTimeStamp1 > psKPI->ullTimeStampD)
+			g_ResponseTimeAccu +=
+				psKPI->ullTimeStamp1 - psKPI->ullTimeStampD;
+
+		/* GPU time left inside the per frame budget. The
+		 * accumulator is unsigned while the difference is negative
+		 * under overload, so clamp instead of adding.
+		 */
+		{
+			long long ged_budget = psKPI->t_gpu_target;
+
+			if (ged_budget <= 0)
+				ged_budget = psKPI->t_cpu_target;
+			if (ged_budget > psKPI->t_gpu)
+				g_GRemTimeAccu += (unsigned long long)
+					(ged_budget - psKPI->t_gpu);
+		}
 		g_gpu_freq_accum += psKPI->gpu_freq;
 		g_cpu_time_accum += psKPI->ullTimeStamp1 - g_pre_TimeStamp1;
 		g_frame_count++;
@@ -1439,6 +1464,13 @@ static void ged_kpi_work_cb(struct work_struct *psWork)
 			psKPI->t_cpu_fpsgo = psHead->t_cpu_fpsgo;
 			psKPI->t_cpu_target = psHead->t_cpu_target;
 			psKPI->t_gpu_target = psHead->t_gpu_target;
+			/*
+			 * The frame based policy divides by this value, so give
+			 * it the vsync period instead of letting it divide by
+			 * zero when no fps policy has set a target yet.
+			 */
+			if (psKPI->t_gpu_target <= 0)
+				psKPI->t_gpu_target = (int)vsync_period;
 			psKPI->target_fps_margin = psHead->target_fps_margin;
 			psHead->i32Gpu_uncompleted++;
 			psKPI->i32Gpu_uncompleted = psHead->i32Gpu_uncompleted;
@@ -1757,12 +1789,15 @@ static void ged_kpi_work_cb(struct work_struct *psWork)
 				/* checking if there is struct GED_KPI info
 				 * resource monopoly
 				 */
-				if (main_head && main_head->i32Count * 100
-					/ GED_KPI_TOTAL_ITEMS
-					> g_fb_dvfs_threshold)
-					g_force_gpu_dvfs_fallback = 0;
-				else
-					g_force_gpu_dvfs_fallback = 1;
+				/*
+				 * A missing main head is the only case the frame based
+				 * policy genuinely cannot use: it needs the per frame
+				 * gpu time of one specific renderer. The old test also
+				 * required that renderer to own more than 80% of the 64
+				 * KPI slots, which never happens under a Vulkan
+				 * compositor, so the policy was bypassed on every frame.
+				 */
+				g_force_gpu_dvfs_fallback = (main_head == NULL);
 
 #ifdef GED_ENABLE_DYNAMIC_DVFS_MARGIN
 			/* dvfs_margin_mode == */
