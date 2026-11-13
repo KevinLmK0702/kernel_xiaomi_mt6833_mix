@@ -16,12 +16,15 @@
  *            job submit/complete event)
  *   output : mtk_common_gpufreq_commit()
  *
- * It runs from a delayed workqueue because mt_gpufreq_target() takes
- * mutexes and must never be called from softirq context.
- *
  * The OPP is chosen in kbase_platform_dvfs_event(), which kbase's own DVFS
  * timer calls every kbdev->pm.dvfs_period milliseconds. This file owns the
  * policy; GED's DVFS engine is deliberately left unregistered.
+ *
+ * The timer callback runs in softirq context and the commit path takes a
+ * mutex, so the two are split: the timer decides and parks the OPP index,
+ * a dedicated work item does the actual commit. Sampling for the GED
+ * readers runs from its own delayed work. Nothing in the timer path may
+ * sleep.
  */
 
 #include <linux/delay.h>
@@ -50,6 +53,7 @@
 #define MTK_GOV_EMA_WEIGHT	4
 
 static struct delayed_work mtk_gov_work;
+static struct work_struct mtk_gov_commit_work;
 static bool mtk_gov_started;
 
 static DEFINE_SPINLOCK(mtk_gov_lock);
@@ -64,6 +68,16 @@ static unsigned int mtk_gov_avg;
  * management code so that a GPU power on restores a sane frequency instead
  * of always jumping to the fastest OPP. */
 static int mtk_gov_last_idx = -1;
+
+/* Last OPP index the timer asked for, and the request the commit worker
+ * has not picked up yet. The timer runs in softirq context and cannot
+ * take the commit path's mutex, so it only parks the decision here. */
+static int mtk_gov_req_idx = -1;
+static int mtk_gov_pending_idx = -1;
+static int mtk_gov_pending_prev;
+static unsigned int mtk_gov_pending_load;
+static unsigned int mtk_gov_pending_busy;
+static int mtk_gov_pending_level;
 
 /* GED KPI (frame timing) sampling state. */
 static bool mtk_gov_kpi_alive;
@@ -366,6 +380,51 @@ module_param_named(mtk_dvfs_boost_load, mtk_dvfs_boost_load, int, 0644);
 MODULE_PARM_DESC(mtk_dvfs_boost_load, "Load forced while the busy ratio stays high");
 
 
+/*
+ * Commit worker.
+ *
+ * kbase calls kbase_platform_dvfs_event() straight from its DVFS hrtimer,
+ * that is, from softirq context, while mtk_common_gpufreq_commit() takes a
+ * mutex. Sleeping there schedules while atomic and panics:
+ *
+ *   __schedule_bug <- __schedule <- __mutex_lock <- mutex_lock
+ *   <- kbase_platform_dvfs_event <- kbase_pm_get_dvfs_action
+ *   <- dvfs_callback <- __hrtimer_run_queues
+ *
+ * It reproduces easily when the timer happens to fire while another thread
+ * sits inside mt_gpufreq_target():
+ *
+ *   mt_gpufreq_target -> ged_log_buf_print2 -> (irq) -> dvfs_callback
+ *
+ * The policy still runs in the timer, only the commit is handed over to a
+ * worker, which also lets repeated decisions coalesce into one commit.
+ */
+static void mtk_gov_commit_work_fn(struct work_struct *work)
+{
+        unsigned long flags;
+        int idx, prev, level;
+        unsigned int load, busy;
+
+        spin_lock_irqsave(&mtk_gov_lock, flags);
+        idx = mtk_gov_pending_idx;
+        prev = mtk_gov_pending_prev;
+        load = mtk_gov_pending_load;
+        busy = mtk_gov_pending_busy;
+        level = mtk_gov_pending_level;
+        mtk_gov_pending_idx = -1;
+        spin_unlock_irqrestore(&mtk_gov_lock, flags);
+
+        if (idx < 0)
+                return;
+
+        if (mtk_common_gpufreq_commit(idx) == 0) {
+                mtk_common_gpu_note_idx(idx);
+                if (mtk_gov_verbose)
+                        pr_info("mtk_gov: idx %d->%d load=%u busy=%u lvl=%d\n",
+                                prev, idx, load, busy, level);
+        }
+}
+
 static int mtk_dvfs_level_of(unsigned int load)
 {
         if (load >= mtk_dvfs_thr0)
@@ -404,7 +463,9 @@ int kbase_platform_dvfs_event(struct kbase_device *kbdev, u32 utilisation,
         (void)util_gl_share;
         (void)util_cl_share;
 
-        if (!mtk_gov_enable || !kbdev || !mtk_common_pm_is_mfg_active())
+        /* mtk_gov_started also guarantees the commit work is initialised. */
+        if (!mtk_gov_started || !mtk_gov_enable || !kbdev ||
+            !mtk_common_pm_is_mfg_active())
                 return 0;
 
         if (mtk_dvfs_boost_ema > 1) {
@@ -519,14 +580,24 @@ int kbase_platform_dvfs_event(struct kbase_device *kbdev, u32 utilisation,
         if (ceiling > 0 && ceiling < target)
                 target = ceiling;
 
-        prev = mtk_common_gpu_last_idx();
-        if (target != prev) {
-                if (mtk_common_gpufreq_commit(target) == 0) {
-                        mtk_common_gpu_note_idx(target);
-                        if (mtk_gov_verbose)
-                                pr_info("mtk_gov: idx %d->%d load=%u busy=%u lvl=%d\n",
-                                        prev, target, load, boost_ema, cur_level);
-                }
+        /*
+         * Only park the decision here. Compare against the last requested
+         * index rather than the last committed one, because the worker may
+         * not have run yet and the timer would otherwise queue the same
+         * commit every 20 ms.
+         */
+        if (target != mtk_gov_req_idx) {
+                unsigned long flags;
+
+                mtk_gov_req_idx = target;
+                spin_lock_irqsave(&mtk_gov_lock, flags);
+                mtk_gov_pending_idx = target;
+                mtk_gov_pending_prev = mtk_common_gpu_last_idx();
+                mtk_gov_pending_load = load;
+                mtk_gov_pending_busy = boost_ema;
+                mtk_gov_pending_level = cur_level;
+                spin_unlock_irqrestore(&mtk_gov_lock, flags);
+                schedule_work(&mtk_gov_commit_work);
         }
 
         return 1;
@@ -551,9 +622,12 @@ void mtk_common_gpu_dvfs_init(void)
 	mtk_gov_util = 0;
 	mtk_gov_have_last = false;
 	mtk_gov_last_idx = -1;
+	mtk_gov_req_idx = -1;
+	mtk_gov_pending_idx = -1;
 	mtk_gov_kpi_alive = false;
 
 	INIT_DELAYED_WORK(&mtk_gov_work, mtk_gov_work_fn);
+	INIT_WORK(&mtk_gov_commit_work, mtk_gov_commit_work_fn);
 	mtk_gov_started = true;
 	schedule_delayed_work(&mtk_gov_work,
 			      msecs_to_jiffies(MTK_GOV_PERIOD_MS));
@@ -566,6 +640,7 @@ void mtk_common_gpu_dvfs_term(void)
 
 	mtk_gov_started = false;
 	cancel_delayed_work_sync(&mtk_gov_work);
+	cancel_work_sync(&mtk_gov_commit_work);
 }
 
 /* Latest smoothed utilisation, for the GED side readers. */
