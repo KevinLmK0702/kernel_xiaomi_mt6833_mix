@@ -40,6 +40,8 @@ export O=out
 rm -rf out/ && mkdir out
 rm -rf build_kernel.log
 
+rm -rf include/generated include/config arch/arm64/include/generated
+
 print_info "配置内核..."
 
 make -j$(nproc --all) O=out \
