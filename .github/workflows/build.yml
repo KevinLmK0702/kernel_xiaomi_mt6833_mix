@@ -1,0 +1,478 @@
+name: Auto Kernel Builder
+on:
+  push:
+    branches:
+      - lineage-24.0
+      - lineage-24.0-experimental
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（留空则自动生成 vYYMMDD）"
+        required: false
+        default: ""
+      kernelversion:
+        description: "内核版本号（用于 AnyKernel3 显示）"
+        required: true
+        default: "4.14.357-MIX"
+      build_experimental:
+        description: "是否构建 lineage-24.0-experimental 分支"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ARCH: arm64
+  SUBARCH: arm
+  CLANG_VERSION: 16.0.6-20260807
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 1200M
+  CCACHE_COMPILERCHECK: content
+
+jobs:
+  # 构建矩阵：分支 × 变体（Vanilla / BakaSU / BakaSU+SUSFS）
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      version: ${{ steps.matrix.outputs.version }}
+      kernelversion: ${{ steps.matrix.outputs.kernelversion }}
+    steps:
+      - name: 生成构建矩阵与动态版本号
+        id: matrix
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_KERNEL_VERSION: ${{ inputs.kernelversion }}
+          INPUT_BUILD_EXPERIMENTAL: ${{ inputs.build_experimental }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            VERSION="${INPUT_VERSION}"
+          else
+            VERSION="v$(date -u +'%y%m%d')"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+          KVER="${INPUT_KERNEL_VERSION:-4.14.357}"
+          echo "kernelversion=${KVER}" >> "$GITHUB_OUTPUT"
+
+          branches=()
+          if [ "${EVENT_NAME}" = "push" ]; then
+            branches+=("${REF_NAME}")
+          else
+            branches+=("lineage-24.0")
+            if [ "${INPUT_BUILD_EXPERIMENTAL:-true}" = "true" ]; then
+              branches+=("lineage-24.0-experimental")
+            fi
+          fi
+
+          variants=("Vanilla" "BakaSU" "BakaSU+SUSFS")
+
+          matrix='{"include":['
+          first=1
+          for b in "${branches[@]}"; do
+            for v in "${variants[@]}"; do
+              if [ ${first} -eq 0 ]; then matrix+=','; fi
+              matrix+="{\"branch\":\"${b}\",\"variant\":\"${v}\"}"
+              first=0
+            done
+          done
+          matrix+=']}'
+
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          echo "构建矩阵: ${matrix}"
+
+          {
+            echo "### 构建计划"
+            echo ""
+            echo "- 分支: ${branches[*]}"
+            echo "- 变体: Vanilla（不含 KSU）/ BakaSU / BakaSU+SUSFS"
+            echo "- 基础版本: ${VERSION}"
+            echo "- 内核版本: ${KVER}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  build:
+    name: ${{ matrix.branch }} / ${{ matrix.variant }}
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      BASE_VERSION: ${{ needs.prepare.outputs.version }}
+      KER_VER: ${{ needs.prepare.outputs.kernelversion }}
+      BRANCH: ${{ matrix.branch }}
+      VARIANT: ${{ matrix.variant }}
+
+    steps:
+      - name: 克隆并切换到 ${{ matrix.branch }} 分支
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch }}
+          fetch-depth: 1
+
+      - name: 生成缓存键与产物标记
+        run: |
+          set -euo pipefail
+          case "${VARIANT}" in
+            Vanilla)      VARIANT_SLUG="Vanilla" ;;
+            BakaSU)       VARIANT_SLUG="BakaSU" ;;
+            BakaSU+SUSFS) VARIANT_SLUG="BakaSU-SUSFS" ;;
+            *) echo "::error::未知变体 ${VARIANT}"; exit 1 ;;
+          esac
+          CCACHE_KEY="ccache-${BRANCH}-${VARIANT_SLUG}"
+          # 实验分支的产物文件名带 -experimental，避免和稳定包同名混淆
+          if [ "${BRANCH}" = "lineage-24.0-experimental" ]; then
+            EXP_TAG="-experimental"
+          else
+            EXP_TAG=""
+          fi
+          {
+            echo "DATE_STR=$(date +'%y%m%d')"
+            echo "CCACHE_KEY=${CCACHE_KEY}"
+            echo "EXP_TAG=${EXP_TAG}"
+          } >> "$GITHUB_ENV"
+          echo "ccache 键: ${CCACHE_KEY}"
+
+      - name: 增加 SWAP（10G）
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 10
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev libncurses-dev \
+            ccache cpio kmod rsync zip unzip xz-utils zstd lz4 lzop \
+            libxml2 libxml2-dev libxml2-utils zlib1g-dev python3 perl git curl \
+            git-lfs gnupg gperf imagemagick pngcrush squashfs-tools schedtool xsltproc
+
+      - name: 恢复工具链缓存
+        id: tc-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/toolchains
+          key: toolchains-clang-${{ env.CLANG_VERSION }}-gcc4.9-android12L
+
+      - name: 下载工具链（ZyCromerZ Clang + Google GCC 4.9 / android12L-release）
+        if: steps.tc-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/toolchains"
+
+          # ZyCromerZ Clang 16.0.6
+          curl -fL --retry 5 --retry-delay 5 -o /tmp/clang.tar.gz \
+            "https://github.com/ZyCromerZ/Clang/releases/download/${CLANG_VERSION}-release/Clang-${CLANG_VERSION}.tar.gz"
+          rm -rf /tmp/clang-extract "$HOME/toolchains/Clang-16.0"
+          mkdir -p /tmp/clang-extract
+          tar -xzf /tmp/clang.tar.gz -C /tmp/clang-extract
+          mv /tmp/clang-extract "$HOME/toolchains/Clang-16.0"
+          test -x "$HOME/toolchains/Clang-16.0/bin/clang"
+
+          # Google GCC 4.9 binutils（android12L-release）
+          rm -rf "$HOME/toolchains/gcc-arm64" "$HOME/toolchains/gcc-arm"
+          git clone --depth=1 --single-branch -b android12L-release \
+            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 \
+            "$HOME/toolchains/gcc-arm64"
+          git clone --depth=1 --single-branch -b android12L-release \
+            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9 \
+            "$HOME/toolchains/gcc-arm"
+
+      # 六个矩阵任务中只有 job 0 负责落盘，工具链缓存永远只有一份
+      - name: 保存工具链缓存
+        if: steps.tc-cache.outputs.cache-hit != 'true' && strategy.job-index == 0
+        uses: actions/cache/save@v4
+        with:
+          path: ~/toolchains
+          key: toolchains-clang-${{ env.CLANG_VERSION }}-gcc4.9-android12L
+
+      - name: 配置编译器环境
+        run: |
+          set -euo pipefail
+          CLANG_DIR="$HOME/toolchains/Clang-16.0"
+          GCC64="$HOME/toolchains/gcc-arm64"
+          GCC32="$HOME/toolchains/gcc-arm"
+
+          printf 'CLANG_DIR=%s\nGCC64=%s\nGCC32=%s\n' "$CLANG_DIR" "$GCC64" "$GCC32" >> "$GITHUB_ENV"
+          printf '%s\n' "${CLANG_DIR}/bin" "${GCC64}/bin" "${GCC32}/bin" >> "$GITHUB_PATH"
+
+          
+          export LD_LIBRARY_PATH="${CLANG_DIR}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+          echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+
+          "${CLANG_DIR}/bin/clang" --version | head -n 1
+          "${CLANG_DIR}/bin/ld.lld" --version
+          "${GCC64}/bin/aarch64-linux-android-as" --version | head -n 1
+          "${GCC32}/bin/arm-linux-androideabi-as" --version | head -n 1
+
+      # 固定键：每个矩阵任务一份 ccache，共 6 份
+      - name: 恢复 ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ env.CCACHE_KEY }}
+
+      
+      - name: 集成 BakaSU / SUSFS 并在 evergo_defconfig 里追加对应配置
+        run: |
+          set -euo pipefail
+
+          if [ "${VARIANT}" != "Vanilla" ]; then
+            echo "==> [1/3] 集成 BakaSU"
+            curl -fsSL --retry 5 --retry-delay 3 \
+              -o /tmp/bakasu_setup.sh \
+              "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh"
+
+            bash /tmp/bakasu_setup.sh --cleanup || true
+            bash /tmp/bakasu_setup.sh
+
+            test -d KernelSU
+            test -L drivers/kernelsu
+            grep -q 'kernelsu' drivers/Makefile
+            grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig
+
+            if [ "${VARIANT}" = "BakaSU" ]; then
+              echo "==> [2/3] 应用 BakaSU syscall hook 补丁"
+              curl -fsSL --retry 5 --retry-delay 3 \
+                -o /tmp/syscall_hook_patches.sh \
+                "https://raw.githubusercontent.com/KevinLmK0702/NonGKI_Kernel_Build_2nd/refs/heads/mainline/Patches/syscall_hook_patches.sh"
+              bash /tmp/syscall_hook_patches.sh
+              grep -q 'ksu_handle' fs/exec.c
+
+            elif [ "${VARIANT}" = "BakaSU+SUSFS" ]; then
+              echo "==> [2/3] 应用 SUSFS 内核补丁"
+              curl -fsSL --retry 5 --retry-delay 3 -o susfs_patch_to_4.14_fixed.patch \
+                "https://raw.githubusercontent.com/KevinLmK0702/mix_kernel_extension/refs/heads/patches/KSUPatches/susfs_patch_to_4.14_fixed.patch"
+              git apply --verbose susfs_patch_to_4.14_fixed.patch
+              test -f fs/susfs.c
+              test -f include/linux/susfs.h
+
+              echo "==> [3/3] 应用 SUSFS inline hook 补丁"
+              curl -fsSL --retry 5 --retry-delay 3 \
+                -o /tmp/susfs_inline_hook_patches.sh \
+                "https://raw.githubusercontent.com/KevinLmK0702/NonGKI_Kernel_Build_2nd/refs/heads/mainline/Patches/susfs_inline_hook_patches.sh"
+              bash /tmp/susfs_inline_hook_patches.sh
+
+              grep -q 'ksu_handle' fs/stat.c
+            else
+              echo "::error::未知变体 ${VARIANT}"
+              exit 1
+            fi
+          fi
+
+          echo "==> 追加配置到 evergo_defconfig"
+          cfg=arch/arm64/configs/evergo_defconfig
+
+          sed -i -E '/^CONFIG_KSU(=|_)/d; /^# CONFIG_KSU([ _]|$)/d' "$cfg"
+          echo "" >> "$cfg"
+
+          case "${VARIANT}" in
+            Vanilla)
+              echo "[-] Vanilla 变体：不添加任何 KSU 配置"
+              ;;
+            BakaSU)
+              cat >> "$cfg" <<'EOF'
+          CONFIG_KSU=y
+          CONFIG_KSU_MANUAL_HOOK=y
+          EOF
+              ;;
+            BakaSU+SUSFS)
+              cat >> "$cfg" <<'EOF'
+          CONFIG_KSU=y
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_MAP=y
+          EOF
+              ;;
+            *)
+              echo "::error::未知变体 ${VARIANT}"
+              exit 1
+              ;;
+          esac
+
+          # 动态内核版本号：<BASE_VERSION>[-BakaSU-<版本>][-SUSFS-<版本>]
+          case "${VARIANT}" in
+            Vanilla)
+              VARIANT_TAGS="Vanilla"
+              KERNEL_VERSION="${BASE_VERSION}"
+              ;;
+            BakaSU|BakaSU+SUSFS)
+              BAKASU_VER="$(git -C KernelSU describe --tags --abbrev=0 | sed -E 's/^v//; s/-rc[0-9]+$//')"
+              VARIANT_TAGS="BakaSU-${BAKASU_VER}"
+              if [ "${VARIANT}" = "BakaSU+SUSFS" ]; then
+                SUSFS_VER="$(sed -nE 's/^#define[[:space:]]+SUSFS_VERSION[[:space:]]+"v?([0-9][^"]*)".*/\1/p' include/linux/susfs.h)"
+                VARIANT_TAGS="${VARIANT_TAGS}-SUSFS-${SUSFS_VER}"
+              fi
+              KERNEL_VERSION="${BASE_VERSION}-${VARIANT_TAGS}"
+              ;;
+            *)
+              echo "::error::未知变体 ${VARIANT}"
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "VERSION=${KERNEL_VERSION}"
+            echo "VARIANT_TAGS=${VARIANT_TAGS}"
+          } >> "$GITHUB_ENV"
+          echo "内核版本号: ${KERNEL_VERSION}"
+          echo "产物标记: ${VARIANT_TAGS}"
+
+      - name: 编译内核
+        run: |
+          set -euo pipefail
+
+          FLGS="--target=aarch64-linux-gnu -Wno-implicit-function-declaration -Wno-unused-but-set-variable -Wno-unused-variable -Wno-unused-function -Wno-unused-label -Wno-incompatible-pointer-types"
+
+          MAKE_ARGS=(
+            CC="ccache ${CLANG_DIR}/bin/clang"
+            LD="${CLANG_DIR}/bin/ld.lld"
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE="${GCC64}/bin/aarch64-linux-android-"
+            CROSS_COMPILE_COMPAT="${GCC32}/bin/arm-linux-androideabi-"
+            CROSS_COMPILE_ARM32="${GCC32}/bin/arm-linux-androideabi-"
+            LLVM_IAS=1
+            KCFLAGS="${FLGS}"
+          )
+
+          ccache --max-size="${CCACHE_MAXSIZE}" || true
+          ccache --show-stats || true
+
+          make -j"$(nproc)" O=out "${MAKE_ARGS[@]}" evergo_defconfig
+
+          echo "===== out/.config 中的 KSU 配置 ====="
+          grep -nE '^CONFIG_KSU|^# CONFIG_KSU' out/.config || true
+
+          if [ "${VARIANT}" != "Vanilla" ]; then
+            grep -q '^CONFIG_KSU=y' out/.config \
+              || { echo "::error::CONFIG_KSU 未生效（可能被 Kconfig 依赖钳制）"; exit 1; }
+          fi
+          if [ "${VARIANT}" = "BakaSU+SUSFS" ]; then
+            grep -q '^CONFIG_KSU_SUSFS=y' out/.config \
+              || { echo "::error::CONFIG_KSU_SUSFS 未生效"; exit 1; }
+          fi
+          grep -q '^CONFIG_LOCALVERSION_AUTO=y' out/.config \
+            || { echo "::error::CONFIG_LOCALVERSION_AUTO 未生效，.scmversion 会被静默忽略"; exit 1; }
+
+          echo "-${VERSION}" > .scmversion
+
+          make -j"$(nproc)" O=out "${MAKE_ARGS[@]}" Image.gz dtbs 2>&1 | tee build.log
+
+          test -f out/arch/arm64/boot/Image
+          echo "最终内核版本号: $(cat out/include/config/kernel.release)"
+          ls -lh out/arch/arm64/boot/Image out/arch/arm64/boot/Image.gz
+
+      # 先删同名旧缓存再存，保证每个 ccache 键永远只有一份
+      - name: 更新 ccache
+        if: always()
+        run: |
+          mkdir -p "${CCACHE_DIR}"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/caches?key=${CCACHE_KEY}" \
+            --jq '.actions_caches[].id' \
+            | xargs -r -I{} gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/caches/{}"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: 保存 ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ env.CCACHE_KEY }}
+
+      # 产出 Image.kp；out/arch/arm64/boot/Image 保持未打补丁，两者都参与打包
+      - name: 修补 KPatch-Next-EXP（仅 BakaSU / BakaSU+SUSFS）
+        if: matrix.variant != 'Vanilla'
+        run: |
+          set -euo pipefail
+
+          KP_VERSION="0.13.14"
+          KP_BASE="https://github.com/741afb7/KPatch-Next-EXP/releases/download/${KP_VERSION}"
+
+          curl -fsSL --retry 3 -o kpimg "${KP_BASE}/kpimg-linux"
+          curl -fsSL --retry 3 -o kptools "${KP_BASE}/kptools-linux"
+          chmod +x kpimg kptools
+
+          ./kptools -p -i out/arch/arm64/boot/Image -k kpimg -o Image.kp
+
+          ./kptools -l -i Image.kp | tee kpatch-info.log
+          grep -qx 'patched=true' kpatch-info.log
+
+          ls -lh out/arch/arm64/boot/Image Image.kp
+          rm -f kpimg kptools kpatch-info.log
+
+      - name: 打包 AnyKernel3
+        run: |
+          set -euo pipefail
+
+          TAGS="${VARIANT_TAGS}"
+
+          rm -rf AnyKernel3
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          rm -rf AnyKernel3/.git
+
+          KSTR="Evergo and Everpal Kernel, compiled on ${DATE_STR}"
+
+          sed -i "s/^kernel\.string=.*/kernel.string=${KSTR}/" AnyKernel3/anykernel.sh
+          sed -i 's/^device\.name1=.*/device.name1=evergo/' AnyKernel3/anykernel.sh
+          sed -i 's/^device\.name2=.*/device.name2=everpal/' AnyKernel3/anykernel.sh
+          sed -i '/^device\.name[3-5]=.*/d' AnyKernel3/anykernel.sh
+          sed -i 's/^BLOCK=.*/BLOCK=boot;/' AnyKernel3/anykernel.sh
+          sed -i 's/^IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=auto;/' AnyKernel3/anykernel.sh
+          sed -i '/^backup_file init\.rc;/,/^append_file fstab\.tuna/d' AnyKernel3/anykernel.sh
+
+          grep -nE 'kernel\.string|device\.name|^BLOCK=|^IS_SLOT_DEVICE=' AnyKernel3/anykernel.sh
+
+          # 镜像 → 附加标记；非 Vanilla 变体各打两个包（原版 / KPN-EXP）
+          COMBOS=("out/arch/arm64/boot/Image|")
+          if [ "${VARIANT}" != "Vanilla" ]; then
+            COMBOS+=("Image.kp|-KPN-EXP")
+          fi
+
+          for combo in "${COMBOS[@]}"; do
+            img="${combo%|*}"
+            kp_tag="${combo#*|}"
+            zip_name="Mix-Kernel-${TAGS}${kp_tag}-${BASE_VERSION#v}${EXP_TAG}.zip"
+            cp -f "${img}" AnyKernel3/Image
+            rm -f "${zip_name}"
+            ( cd AnyKernel3 && zip -r9 "../${zip_name}" . > /dev/null )
+            ls -lh "${zip_name}"
+          done
+
+          echo "ARTIFACT_NAME=Mix-Kernel-${TAGS}-${BASE_VERSION#v}-${BRANCH}" >> "$GITHUB_ENV"
+
+      - name: 上传 AnyKernel3 压缩包
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: Mix-Kernel-*.zip
+          if-no-files-found: error
+
+      - name: 上传构建日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME || format('build-{0}-{1}', matrix.branch, matrix.variant) }}-log
+          path: build.log
+          if-no-files-found: ignore
